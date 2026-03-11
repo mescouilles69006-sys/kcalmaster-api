@@ -4,390 +4,141 @@ const fetch   = require('node-fetch');
 require('dotenv').config();
 
 const app = express();
-
-// ── Middleware ───────────────────────────────────────────────
 app.use(express.json({ limit: '20mb' }));
+app.use(cors({ origin: function(o,cb){cb(null,true)}, methods:['GET','POST','OPTIONS'], allowedHeaders:['Content-Type','Authorization'], credentials:true }));
 
-// CORS élargi : accepte navigateurs, WebIntoApp, Cordova (file://)
-app.use(cors({
-  origin: function(origin, callback) {
-    return callback(null, true);
-  },
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
-
-// ── Variables ────────────────────────────────────────────────
-const GROQ_API_KEY   = process.env.GROQ_API_KEY;
-const GROQ_URL       = 'https://api.groq.com/openai/v1/chat/completions';
-
+const GROQ_API_KEY      = process.env.GROQ_API_KEY;
+const GROQ_URL          = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_CHAT_MODEL   = 'llama-3.3-70b-versatile';
 const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
-
-// ── Google Fit OAuth ─────────────────────────────────────────
-const GFIT_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     || '241850404756-f3mulk7lvrgsos28gcah1gi9nuie6jd8.apps.googleusercontent.com';
-const GFIT_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET; // à configurer dans Render
+const GFIT_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID || '241850404756-f3mulk7lvrgsos28gcah1gi9nuie6jd8.apps.googleusercontent.com';
+const GFIT_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const GFIT_REDIRECT_URI  = 'https://kcalmaster-api.onrender.com/api/gfit/callback';
-const GFIT_SCOPES        = [
-  'https://www.googleapis.com/auth/fitness.activity.read',
-  'https://www.googleapis.com/auth/fitness.sleep.read',
-  'https://www.googleapis.com/auth/fitness.heart_rate.read'
-].join(' ');
+const GFIT_SCOPES        = 'https://www.googleapis.com/auth/fitness.activity.read https://www.googleapis.com/auth/fitness.sleep.read https://www.googleapis.com/auth/fitness.heart_rate.read';
 
-// ── Helper : appel Groq avec retry ──────────────────────────
-async function callGroq(body, retries = 2) {
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const response = await fetch(GROQ_URL, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body)
-      });
+// Stockage temporaire tokens (TTL 10 min)
+const _pendingTokens = new Map();
+function _store(state, data){ _pendingTokens.set(state,{...data,ts:Date.now()}); setTimeout(()=>_pendingTokens.delete(state),600000); }
+setInterval(()=>{ const n=Date.now(); _pendingTokens.forEach((v,k)=>{ if(n-v.ts>600000) _pendingTokens.delete(k); }); },300000);
 
-      const data = await response.json();
-
-      if (!response.ok) {
-        if ((response.status === 429 || response.status === 503) && attempt < retries) {
-          const wait = (attempt + 1) * 3000;
-          console.warn(`⚠️ Groq ${response.status} — retry ${attempt + 1}/${retries} dans ${wait}ms`);
-          await new Promise(r => setTimeout(r, wait));
-          continue;
-        }
-        throw { status: response.status, message: data.error?.message || `Groq error ${response.status}` };
-      }
-
-      return data;
-
-    } catch (err) {
-      if (err.status) throw err;
-      if (attempt < retries) {
-        console.warn(`🔌 Erreur réseau — retry ${attempt + 1}/${retries}`);
-        await new Promise(r => setTimeout(r, 2000));
-        continue;
-      }
-      throw { status: 500, message: err.message };
-    }
+async function callGroq(body, retries=2){
+  for(let a=0;a<=retries;a++){
+    try{
+      const r=await fetch(GROQ_URL,{method:'POST',headers:{'Authorization':`Bearer ${GROQ_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify(body)});
+      const d=await r.json();
+      if(!r.ok){ if((r.status===429||r.status===503)&&a<retries){await new Promise(r=>setTimeout(r,(a+1)*3000));continue;} throw{status:r.status,message:d.error?.message||'Groq error'}; }
+      return d;
+    }catch(e){ if(e.status) throw e; if(a<retries){await new Promise(r=>setTimeout(r,2000));continue;} throw{status:500,message:e.message}; }
   }
 }
 
-// ── Route santé ──────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'KcalMaster API (Groq)' });
-});
+app.get('/',(req,res)=>res.json({status:'ok',service:'KcalMaster API (Groq)'}));
+app.get('/health',(req,res)=>res.json({status:'OK',models:{chat:GROQ_CHAT_MODEL,vision:GROQ_VISION_MODEL},gfit:GFIT_CLIENT_SECRET?'✅':'⚠️ secret manquant'}));
 
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'OK',
-    message: 'KcalMaster API with Groq is running',
-    models: { chat: GROQ_CHAT_MODEL, vision: GROQ_VISION_MODEL }
-  });
-});
-
-// ── Route /api/claude — Chat texte ───────────────────────────
-app.post('/api/claude', async (req, res) => {
-  try {
-    if (!GROQ_API_KEY) {
-      return res.status(500).json({ error: 'GROQ_API_KEY not configured on server' });
-    }
-
-    const { messages, max_tokens = 1000 } = req.body;
-    if (!messages || !Array.isArray(messages)) {
-      return res.status(400).json({ error: 'messages[] requis' });
-    }
-
+app.post('/api/claude',async(req,res)=>{
+  try{
+    if(!GROQ_API_KEY) return res.status(500).json({error:'GROQ_API_KEY not configured'});
+    const{messages,max_tokens=1000}=req.body;
+    if(!messages||!Array.isArray(messages)) return res.status(400).json({error:'messages[] requis'});
     console.log(`📡 /api/claude — model: ${GROQ_CHAT_MODEL} max_tokens: ${max_tokens}`);
-
-    const data = await callGroq({
-      model: GROQ_CHAT_MODEL,
-      messages,
-      max_tokens,
-      temperature: 0.7
-    });
-
-    res.json({
-      content: [{ type: 'text', text: data.choices[0].message.content }]
-    });
-
-  } catch (err) {
-    console.error('❌ /api/claude error:', err);
-    res.status(err.status || 500).json({ error: err.message || 'Server error' });
-  }
+    const d=await callGroq({model:GROQ_CHAT_MODEL,messages,max_tokens,temperature:0.7});
+    res.json({content:[{type:'text',text:d.choices[0].message.content}]});
+  }catch(e){console.error('❌ /api/claude:',e);res.status(e.status||500).json({error:e.message||'Server error'});}
 });
 
-// ── Route /api/vision — Analyse d'image ─────────────────────
-app.post('/api/vision', async (req, res) => {
-  try {
-    if (!GROQ_API_KEY) {
-      return res.status(500).json({ error: 'GROQ_API_KEY not configured on server' });
-    }
-
-    const { image_base64, prompt = 'Analysez ce repas' } = req.body;
-    if (!image_base64) {
-      return res.status(400).json({ error: 'image_base64 requis' });
-    }
-
+app.post('/api/vision',async(req,res)=>{
+  try{
+    if(!GROQ_API_KEY) return res.status(500).json({error:'GROQ_API_KEY not configured'});
+    const{image_base64,prompt='Analysez ce repas'}=req.body;
+    if(!image_base64) return res.status(400).json({error:'image_base64 requis'});
     console.log(`📷 /api/vision — model: ${GROQ_VISION_MODEL}`);
+    const d=await callGroq({model:GROQ_VISION_MODEL,messages:[{role:'user',content:[{type:'text',text:prompt},{type:'image_url',image_url:{url:`data:image/jpeg;base64,${image_base64}`}}]}],max_tokens:1024});
+    res.json({content:[{type:'text',text:d.choices[0].message.content}]});
+  }catch(e){console.error('❌ /api/vision:',e);res.status(e.status||500).json({error:e.message||'Server error'});}
+});
 
-    const data = await callGroq({
-      model: GROQ_VISION_MODEL,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'text', text: prompt },
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${image_base64}` } }
-        ]
-      }],
-      max_tokens: 1024
-    });
+// ══ GOOGLE FIT — Flux Chrome système + polling ══
 
-    res.json({
-      content: [{ type: 'text', text: data.choices[0].message.content }]
-    });
+app.get('/api/gfit/auth',(req,res)=>{
+  if(!GFIT_CLIENT_SECRET) return res.status(500).send('<h2>GOOGLE_CLIENT_SECRET manquant dans Render</h2>');
+  const state=req.query.state||('s'+Math.random().toString(36).slice(2));
+  const url='https://accounts.google.com/o/oauth2/v2/auth?'+new URLSearchParams({client_id:GFIT_CLIENT_ID,redirect_uri:GFIT_REDIRECT_URI,scope:GFIT_SCOPES,response_type:'code',access_type:'offline',prompt:'consent',state}).toString();
+  console.log(`🔗 /api/gfit/auth — state:${state.slice(0,8)}`);
+  res.redirect(url);
+});
 
-  } catch (err) {
-    console.error('❌ /api/vision error:', err);
-    res.status(err.status || 500).json({ error: err.message || 'Server error' });
+app.get('/api/gfit/callback',async(req,res)=>{
+  const{code,error,state}=req.query;
+  if(error||!code){
+    if(state) _store(state,{error:error||'cancelled'});
+    return res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>KcalMaster</title></head><body style="font-family:sans-serif;background:#111;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;flex-direction:column;text-align:center;padding:24px"><div style="font-size:3rem">❌</div><h2>Connexion annulée</h2><p style="color:#888">Retournez dans KcalMaster et réessayez.</p></body></html>`);
+  }
+  try{
+    const r=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({code,client_id:GFIT_CLIENT_ID,client_secret:GFIT_CLIENT_SECRET,redirect_uri:GFIT_REDIRECT_URI,grant_type:'authorization_code'}).toString()});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.error_description||d.error||'Token exchange failed');
+    console.log(`✅ Token obtenu — state:${(state||'').slice(0,8)}`);
+    if(state) _store(state,{access_token:d.access_token,expires_in:d.expires_in||3600,refresh_token:d.refresh_token||''});
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>KcalMaster — Succès</title><style>body{font-family:-apple-system,sans-serif;background:#0d1117;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;flex-direction:column;text-align:center;padding:24px;box-sizing:border-box}.icon{font-size:4rem;margin-bottom:16px;animation:pop .4s cubic-bezier(.34,1.56,.64,1)}@keyframes pop{0%{transform:scale(0)}100%{transform:scale(1)}}h2{color:#00e676;margin:0 0 10px}p{color:#888;font-size:.9rem;line-height:1.6;margin:0 0 24px}.badge{background:rgba(0,230,118,.1);border:1px solid rgba(0,230,118,.3);border-radius:12px;padding:14px 20px;font-size:.85rem;color:#00e676}</style></head><body><div class="icon">✅</div><h2>Google Fit connecté !</h2><p>Votre compte est lié à KcalMaster.<br>Vous pouvez fermer cet onglet et retourner dans l'application.</p><div class="badge">🏃 Synchronisation active</div></body></html>`);
+  }catch(e){
+    console.error('❌ callback error:',e.message);
+    if(state) _store(state,{error:e.message});
+    res.status(500).send(`<html><body style="background:#111;color:#fff;padding:40px;text-align:center;font-family:sans-serif"><h2>❌ Erreur</h2><p>${e.message}</p></body></html>`);
   }
 });
 
-// ════════════════════════════════════════════════════════════
-// ── GOOGLE FIT OAUTH ─────────────────────────────────────────
-// ════════════════════════════════════════════════════════════
-
-/**
- * ÉTAPE 1 — Redirige vers la page de connexion Google
- * L'app ouvre : https://kcalmaster-api.onrender.com/api/gfit/auth
- */
-app.get('/api/gfit/auth', (req, res) => {
-  if (!GFIT_CLIENT_SECRET) {
-    return res.status(500).send(`
-      <html><body style="font-family:sans-serif;padding:40px;background:#1a1a2e;color:#fff">
-        <h2>❌ GOOGLE_CLIENT_SECRET manquant</h2>
-        <p>Ajoute la variable d'environnement <strong>GOOGLE_CLIENT_SECRET</strong> dans Render → Environment.</p>
-      </body></html>
-    `);
-  }
-
-  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
-    client_id:     GFIT_CLIENT_ID,
-    redirect_uri:  GFIT_REDIRECT_URI,
-    scope:         GFIT_SCOPES,
-    response_type: 'code',
-    access_type:   'offline',
-    prompt:        'consent'
-  }).toString();
-
-  console.log('🔗 /api/gfit/auth — redirect to Google OAuth');
-  res.redirect(authUrl);
+// L'app poll cette route pour récupérer le token
+app.get('/api/gfit/token',(req,res)=>{
+  const{state}=req.query;
+  if(!state) return res.status(400).json({error:'state requis'});
+  const p=_pendingTokens.get(state);
+  if(!p) return res.json({status:'pending'});
+  if(p.error){ _pendingTokens.delete(state); return res.json({status:'error',error:p.error}); }
+  _pendingTokens.delete(state);
+  console.log(`📦 Token récupéré — state:${state.slice(0,8)}`);
+  res.json({status:'ok',access_token:p.access_token,expires_in:p.expires_in,refresh_token:p.refresh_token});
 });
 
-/**
- * ÉTAPE 2 — Google redirige ici après connexion
- * Le serveur échange le code contre un token
- * puis redirige vers https://localhost/#access_token=XXX
- * (détecté par l'InAppBrowser Cordova via loadstart)
- */
-app.get('/api/gfit/callback', async (req, res) => {
-  const { code, error } = req.query;
-
-  if (error || !code) {
-    console.warn('⚠️ /api/gfit/callback — annulé ou erreur:', error);
-    return res.redirect('https://localhost/#gfit_error=' + encodeURIComponent(error || 'cancelled'));
-  }
-
-  if (!GFIT_CLIENT_SECRET) {
-    return res.redirect('https://localhost/#gfit_error=missing_secret');
-  }
-
-  try {
-    console.log('🔄 /api/gfit/callback — échange du code contre un token…');
-
-    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        code,
-        client_id:     GFIT_CLIENT_ID,
-        client_secret: GFIT_CLIENT_SECRET,
-        redirect_uri:  GFIT_REDIRECT_URI,
-        grant_type:    'authorization_code'
-      }).toString()
-    });
-
-    const tokenData = await tokenResp.json();
-
-    if (!tokenResp.ok) {
-      console.error('❌ Token exchange failed:', tokenData);
-      throw new Error(tokenData.error_description || tokenData.error || 'Token exchange failed');
-    }
-
-    const { access_token, expires_in, refresh_token } = tokenData;
-    console.log('✅ Token Google Fit obtenu — expires_in:', expires_in);
-
-    // Rediriger vers localhost avec le token dans le fragment (#)
-    // → Détecté par l'InAppBrowser Cordova via l'événement loadstart
-    const redirectUrl = 'https://localhost/#' + new URLSearchParams({
-      gfit_token:      access_token,
-      gfit_expires_in: String(expires_in || 3600),
-      gfit_refresh:    refresh_token || ''
-    }).toString();
-
-    res.redirect(redirectUrl);
-
-  } catch (err) {
-    console.error('❌ /api/gfit/callback error:', err.message);
-    res.redirect('https://localhost/#gfit_error=' + encodeURIComponent(err.message));
-  }
-});
-
-/**
- * ÉTAPE 3 — Proxy Google Fit API
- * L'app envoie son token, le serveur appelle Google Fit et retourne les données
- * POST /api/gfit/data  { startMs, endMs }
- * Header : Authorization: Bearer <access_token>
- */
-app.post('/api/gfit/data', async (req, res) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Token manquant — connecte-toi à Google Fit d\'abord' });
-  }
-
-  const token = authHeader.split(' ')[1];
-  const { startMs, endMs } = req.body;
-
-  if (!startMs || !endMs) {
-    return res.status(400).json({ error: 'startMs et endMs requis' });
-  }
-
-  const fitHeaders = {
-    'Authorization': `Bearer ${token}`,
-    'Content-Type': 'application/json'
-  };
-
-  const aggregateBody = (dataTypeName) => JSON.stringify({
-    aggregateBy: [{ dataTypeName }],
-    bucketByTime: { durationMillis: 86400000 },
-    startTimeMillis: startMs,
-    endTimeMillis: endMs
-  });
-
-  try {
-    const [stepsResp, calResp] = await Promise.all([
-      fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate', {
-        method: 'POST', headers: fitHeaders,
-        body: aggregateBody('com.google.step_count.delta')
-      }),
-      fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate', {
-        method: 'POST', headers: fitHeaders,
-        body: aggregateBody('com.google.calories.expended')
-      })
+app.post('/api/gfit/data',async(req,res)=>{
+  const auth=req.headers.authorization;
+  if(!auth||!auth.startsWith('Bearer ')) return res.status(401).json({error:'Token manquant'});
+  const token=auth.split(' ')[1];
+  const{startMs,endMs}=req.body;
+  if(!startMs||!endMs) return res.status(400).json({error:'startMs et endMs requis'});
+  const h={'Authorization':`Bearer ${token}`,'Content-Type':'application/json'};
+  const agg=(t)=>JSON.stringify({aggregateBy:[{dataTypeName:t}],bucketByTime:{durationMillis:86400000},startTimeMillis:startMs,endTimeMillis:endMs});
+  try{
+    const[sr,cr,slr]=await Promise.all([
+      fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate',{method:'POST',headers:h,body:agg('com.google.step_count.delta')}),
+      fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate',{method:'POST',headers:h,body:agg('com.google.calories.expended')}),
+      fetch(`https://www.googleapis.com/fitness/v1/users/me/sessions?startTime=${new Date(startMs-86400000).toISOString()}&endTime=${new Date(endMs).toISOString()}&activityType=72`,{headers:h})
     ]);
-
-    // Récupérer les sessions sommeil
-    const sleepResp = await fetch(
-      `https://www.googleapis.com/fitness/v1/users/me/sessions?startTime=${new Date(startMs - 86400000).toISOString()}&endTime=${new Date(endMs).toISOString()}&activityType=72`,
-      { headers: fitHeaders }
-    );
-
-    if (stepsResp.status === 401 || calResp.status === 401) {
-      return res.status(401).json({ error: 'Token expiré — reconnecte-toi à Google Fit' });
-    }
-
-    const [stepsData, calData, sleepData] = await Promise.all([
-      stepsResp.json(), calResp.json(), sleepResp.json()
-    ]);
-
-    // ── Extraire les pas ──
-    let steps = 0;
-    ((stepsData.bucket || [])[0]?.dataset || []).forEach(ds => {
-      (ds.point || []).forEach(pt => {
-        steps += (pt.value || []).reduce((a, v) => a + (v.intVal || 0), 0);
-      });
-    });
-
-    // ── Extraire les calories brûlées ──
-    let calBurned = 0;
-    ((calData.bucket || [])[0]?.dataset || []).forEach(ds => {
-      (ds.point || []).forEach(pt => {
-        calBurned += (pt.value || []).reduce((a, v) => a + (v.fpVal || 0), 0);
-      });
-    });
-
-    // ── Extraire le sommeil ──
-    let sleepHours = 0;
-    (sleepData.session || []).forEach(sess => {
-      sleepHours += (parseInt(sess.endTimeMillis) - parseInt(sess.startTimeMillis)) / 3600000;
-    });
-
-    // ── Distance estimée depuis pas ──
-    const distKm = parseFloat((steps * 0.00075).toFixed(2));
-
-    console.log(`📊 /api/gfit/data — steps:${steps} cal:${Math.round(calBurned)} sleep:${sleepHours.toFixed(1)}h dist:${distKm}km`);
-
-    res.json({
-      steps,
-      calBurned: Math.round(calBurned),
-      sleepHours: parseFloat(sleepHours.toFixed(1)),
-      distKm
-    });
-
-  } catch (err) {
-    console.error('❌ /api/gfit/data error:', err);
-    res.status(500).json({ error: err.message || 'Erreur Google Fit' });
-  }
+    if(sr.status===401) return res.status(401).json({error:'Token expiré'});
+    const[sd,cd,sld]=await Promise.all([sr.json(),cr.json(),slr.json()]);
+    let steps=0; ((sd.bucket||[])[0]?.dataset||[]).forEach(ds=>(ds.point||[]).forEach(pt=>{steps+=(pt.value||[]).reduce((a,v)=>a+(v.intVal||0),0);}));
+    let cal=0; ((cd.bucket||[])[0]?.dataset||[]).forEach(ds=>(ds.point||[]).forEach(pt=>{cal+=(pt.value||[]).reduce((a,v)=>a+(v.fpVal||0),0);}));
+    let sleep=0; (sld.session||[]).forEach(s=>{sleep+=(parseInt(s.endTimeMillis)-parseInt(s.startTimeMillis))/3600000;});
+    res.json({steps,calBurned:Math.round(cal),sleepHours:parseFloat(sleep.toFixed(1)),distKm:parseFloat((steps*0.00075).toFixed(2))});
+  }catch(e){res.status(500).json({error:e.message});}
 });
 
-/**
- * ÉTAPE 4 (optionnel) — Rafraîchir le token avec le refresh_token
- * POST /api/gfit/refresh  { refresh_token }
- */
-app.post('/api/gfit/refresh', async (req, res) => {
-  const { refresh_token } = req.body;
-  if (!refresh_token) return res.status(400).json({ error: 'refresh_token requis' });
-  if (!GFIT_CLIENT_SECRET) return res.status(500).json({ error: 'GOOGLE_CLIENT_SECRET manquant' });
-
-  try {
-    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        refresh_token,
-        client_id:     GFIT_CLIENT_ID,
-        client_secret: GFIT_CLIENT_SECRET,
-        grant_type:    'refresh_token'
-      }).toString()
-    });
-
-    const data = await tokenResp.json();
-    if (!tokenResp.ok) throw new Error(data.error_description || 'Refresh failed');
-
-    res.json({
-      access_token: data.access_token,
-      expires_in:   data.expires_in || 3600
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+app.post('/api/gfit/refresh',async(req,res)=>{
+  const{refresh_token}=req.body;
+  if(!refresh_token) return res.status(400).json({error:'refresh_token requis'});
+  if(!GFIT_CLIENT_SECRET) return res.status(500).json({error:'GOOGLE_CLIENT_SECRET manquant'});
+  try{
+    const r=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({refresh_token,client_id:GFIT_CLIENT_ID,client_secret:GFIT_CLIENT_SECRET,grant_type:'refresh_token'}).toString()});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.error_description||'Refresh failed');
+    res.json({access_token:d.access_token,expires_in:d.expires_in||3600});
+  }catch(e){res.status(500).json({error:e.message});}
 });
 
-// ── Erreurs globales ─────────────────────────────────────────
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
+app.use((err,req,res,next)=>{ console.error('Unhandled:',err); res.status(500).json({error:'Internal server error'}); });
 
-// ── Démarrage ────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
-
-app.listen(PORT, HOST, () => {
-  console.log(`🚀 KcalMaster API with Groq running on http://${HOST}:${PORT}`);
-  console.log(`📡 Chat model  : ${GROQ_CHAT_MODEL}`);
-  console.log(`📷 Vision model: ${GROQ_VISION_MODEL}`);
-  console.log(`🔑 GROQ_API_KEY: ${GROQ_API_KEY ? '✅ configurée' : '❌ MANQUANTE'}`);
-  console.log(`🏃 Google Fit  : ${GFIT_CLIENT_SECRET ? '✅ secret configuré' : '⚠️ GOOGLE_CLIENT_SECRET manquant'}`);
+const PORT=process.env.PORT||3000, HOST=process.env.HOST||'0.0.0.0';
+app.listen(PORT,HOST,()=>{
+  console.log(`🚀 KcalMaster API running on http://${HOST}:${PORT}`);
+  console.log(`📡 Chat: ${GROQ_CHAT_MODEL} | 📷 Vision: ${GROQ_VISION_MODEL}`);
+  console.log(`🔑 GROQ: ${GROQ_API_KEY?'✅':'❌'} | 🏃 GFit: ${GFIT_CLIENT_SECRET?'✅':'⚠️ secret manquant'}`);
 });
