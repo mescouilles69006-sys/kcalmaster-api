@@ -107,16 +107,36 @@ app.post('/api/gfit/data',async(req,res)=>{
   if(!startMs||!endMs) return res.status(400).json({error:'startMs et endMs requis'});
   const h={'Authorization':`Bearer ${token}`,'Content-Type':'application/json'};
 
-  // Agrégat journalier
-  const agg=(t)=>JSON.stringify({aggregateBy:[{dataTypeName:t}],bucketByTime:{durationMillis:86400000},startTimeMillis:startMs,endTimeMillis:endMs});
+  // Agrégat journalier — bucketByTime sur toute la période pour avoir 1 seul bucket
+  const agg=(t)=>JSON.stringify({
+    aggregateBy:[{dataTypeName:t}],
+    bucketByTime:{durationMillis: endMs - startMs},
+    startTimeMillis:startMs,
+    endTimeMillis:endMs
+  });
+
+  // Agrégat pas uniquement depuis la source "derived" (montre, pas téléphone)
+  // Google Fit : com.google.step_count.delta avec dataSourceId derived filtre les doublons
+  const aggStepsDerived=JSON.stringify({
+    aggregateBy:[{dataTypeName:'com.google.step_count.delta',dataSourceId:'derived:com.google.step_count.delta:com.google.android.gms:merge_step_deltas'}],
+    bucketByTime:{durationMillis: endMs - startMs},
+    startTimeMillis:startMs,
+    endTimeMillis:endMs
+  });
+
   // Agrégat FC par tranches de 30 minutes pour la courbe
-  const aggHR30=JSON.stringify({aggregateBy:[{dataTypeName:'com.google.heart_rate.bpm'}],bucketByTime:{durationMillis:1800000},startTimeMillis:startMs,endTimeMillis:endMs});
+  const aggHR30=JSON.stringify({
+    aggregateBy:[{dataTypeName:'com.google.heart_rate.bpm'}],
+    bucketByTime:{durationMillis:1800000},
+    startTimeMillis:startMs,
+    endTimeMillis:endMs
+  });
 
   try{
     const[sr,cr,slr,hrr,hrPoints30r]=await Promise.all([
-      fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate',{method:'POST',headers:h,body:agg('com.google.step_count.delta')}),
+      fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate',{method:'POST',headers:h,body:aggStepsDerived}),
       fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate',{method:'POST',headers:h,body:agg('com.google.calories.expended')}),
-      fetch(`https://www.googleapis.com/fitness/v1/users/me/sessions?startTime=${new Date(startMs-86400000).toISOString()}&endTime=${new Date(endMs).toISOString()}&activityType=72`,{headers:h}),
+      fetch(`https://www.googleapis.com/fitness/v1/users/me/sessions?startTime=${new Date(startMs).toISOString()}&endTime=${new Date(endMs).toISOString()}&activityType=72`,{headers:h}),
       fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate',{method:'POST',headers:h,body:agg('com.google.heart_rate.bpm')}),
       fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate',{method:'POST',headers:h,body:aggHR30})
     ]);
@@ -124,28 +144,32 @@ app.post('/api/gfit/data',async(req,res)=>{
     if(sr.status===401) return res.status(401).json({error:'Token expiré'});
     const[sd,cd,sld,hrd,hrPtsD]=await Promise.all([sr.json(),cr.json(),slr.json(),hrr.json(),hrPoints30r.json()]);
 
-    // Pas
+    // Pas — somme sur le bucket unique
     let steps=0;
-    ((sd.bucket||[])[0]?.dataset||[]).forEach(ds=>(ds.point||[]).forEach(pt=>{steps+=(pt.value||[]).reduce((a,v)=>a+(v.intVal||0),0);}));
+    (sd.bucket||[]).forEach(b=>(b.dataset||[]).forEach(ds=>(ds.point||[]).forEach(pt=>{
+      steps+=(pt.value||[]).reduce((a,v)=>a+(v.intVal||0),0);
+    })));
 
-    // Calories
+    // Calories brûlées (montre)
     let cal=0;
-    ((cd.bucket||[])[0]?.dataset||[]).forEach(ds=>(ds.point||[]).forEach(pt=>{cal+=(pt.value||[]).reduce((a,v)=>a+(v.fpVal||0),0);}));
+    (cd.bucket||[]).forEach(b=>(b.dataset||[]).forEach(ds=>(ds.point||[]).forEach(pt=>{
+      cal+=(pt.value||[]).reduce((a,v)=>a+(v.fpVal||0),0);
+    })));
 
     // Sommeil
     let sleep=0;
     (sld.session||[]).forEach(s=>{sleep+=(parseInt(s.endTimeMillis)-parseInt(s.startTimeMillis))/3600000;});
 
-    // ── Fréquence cardiaque — moyenne, min, max ──
+    // FC — moyenne, min, max
     let hrVals=[];
-    ((hrd.bucket||[])[0]?.dataset||[]).forEach(ds=>(ds.point||[]).forEach(pt=>{
+    (hrd.bucket||[]).forEach(b=>(b.dataset||[]).forEach(ds=>(ds.point||[]).forEach(pt=>{
       (pt.value||[]).forEach(v=>{ if(v.fpVal>0) hrVals.push(v.fpVal); });
-    }));
+    })));
     const hrAvg = hrVals.length>0 ? Math.round(hrVals.reduce((a,b)=>a+b,0)/hrVals.length) : 0;
     const hrMin = hrVals.length>0 ? Math.round(Math.min.apply(null,hrVals)) : 0;
     const hrMax = hrVals.length>0 ? Math.round(Math.max.apply(null,hrVals)) : 0;
 
-    // ── Points FC toutes les 30 min pour la courbe ──
+    // Points FC toutes les 30 min pour la courbe
     const hrPoints=[];
     (hrPtsD.bucket||[]).forEach(bucket=>{
       const bucketStart=parseInt(bucket.startTimeMillis);
@@ -157,10 +181,9 @@ app.post('/api/gfit/data',async(req,res)=>{
         }
       }));
     });
-    // Dédoublonner et trier par temps
     const hrPointsSorted=[...new Map(hrPoints.map(p=>[p.t,p])).values()].sort((a,b)=>a.t-b.t);
 
-    console.log(`📊 FC — avg:${hrAvg} min:${hrMin} max:${hrMax} points:${hrPointsSorted.length}`);
+    console.log(`📊 steps:${steps} cal:${Math.round(cal)} sleep:${sleep.toFixed(1)}h FC:${hrAvg}bpm points:${hrPointsSorted.length}`);
 
     res.json({
       steps,
