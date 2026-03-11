@@ -11,7 +11,6 @@ app.use(express.json({ limit: '20mb' }));
 // CORS élargi : accepte navigateurs, WebIntoApp, Cordova (file://)
 app.use(cors({
   origin: function(origin, callback) {
-    // Pas d'origin = Cordova (file://), Postman, WebIntoApp → autoriser
     return callback(null, true);
   },
   methods: ['GET', 'POST', 'OPTIONS'],
@@ -23,9 +22,18 @@ app.use(cors({
 const GROQ_API_KEY   = process.env.GROQ_API_KEY;
 const GROQ_URL       = 'https://api.groq.com/openai/v1/chat/completions';
 
-// Modèles Groq valides (Mars 2026)
 const GROQ_CHAT_MODEL   = 'llama-3.3-70b-versatile';
 const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+// ── Google Fit OAuth ─────────────────────────────────────────
+const GFIT_CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     || '241850404756-f3mulk7lvrgsos28gcah1gi9nuie6jd8.apps.googleusercontent.com';
+const GFIT_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET; // à configurer dans Render
+const GFIT_REDIRECT_URI  = 'https://kcalmaster-api.onrender.com/api/gfit/callback';
+const GFIT_SCOPES        = [
+  'https://www.googleapis.com/auth/fitness.activity.read',
+  'https://www.googleapis.com/auth/fitness.sleep.read',
+  'https://www.googleapis.com/auth/fitness.heart_rate.read'
+].join(' ');
 
 // ── Helper : appel Groq avec retry ──────────────────────────
 async function callGroq(body, retries = 2) {
@@ -100,7 +108,6 @@ app.post('/api/claude', async (req, res) => {
       temperature: 0.7
     });
 
-    // Format Groq/OpenAI → format Claude (attendu par l'app)
     res.json({
       content: [{ type: 'text', text: data.choices[0].message.content }]
     });
@@ -147,6 +154,226 @@ app.post('/api/vision', async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════
+// ── GOOGLE FIT OAUTH ─────────────────────────────────────────
+// ════════════════════════════════════════════════════════════
+
+/**
+ * ÉTAPE 1 — Redirige vers la page de connexion Google
+ * L'app ouvre : https://kcalmaster-api.onrender.com/api/gfit/auth
+ */
+app.get('/api/gfit/auth', (req, res) => {
+  if (!GFIT_CLIENT_SECRET) {
+    return res.status(500).send(`
+      <html><body style="font-family:sans-serif;padding:40px;background:#1a1a2e;color:#fff">
+        <h2>❌ GOOGLE_CLIENT_SECRET manquant</h2>
+        <p>Ajoute la variable d'environnement <strong>GOOGLE_CLIENT_SECRET</strong> dans Render → Environment.</p>
+      </body></html>
+    `);
+  }
+
+  const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+    client_id:     GFIT_CLIENT_ID,
+    redirect_uri:  GFIT_REDIRECT_URI,
+    scope:         GFIT_SCOPES,
+    response_type: 'code',
+    access_type:   'offline',
+    prompt:        'consent'
+  }).toString();
+
+  console.log('🔗 /api/gfit/auth — redirect to Google OAuth');
+  res.redirect(authUrl);
+});
+
+/**
+ * ÉTAPE 2 — Google redirige ici après connexion
+ * Le serveur échange le code contre un token
+ * puis redirige vers https://localhost/#access_token=XXX
+ * (détecté par l'InAppBrowser Cordova via loadstart)
+ */
+app.get('/api/gfit/callback', async (req, res) => {
+  const { code, error } = req.query;
+
+  if (error || !code) {
+    console.warn('⚠️ /api/gfit/callback — annulé ou erreur:', error);
+    return res.redirect('https://localhost/#gfit_error=' + encodeURIComponent(error || 'cancelled'));
+  }
+
+  if (!GFIT_CLIENT_SECRET) {
+    return res.redirect('https://localhost/#gfit_error=missing_secret');
+  }
+
+  try {
+    console.log('🔄 /api/gfit/callback — échange du code contre un token…');
+
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        code,
+        client_id:     GFIT_CLIENT_ID,
+        client_secret: GFIT_CLIENT_SECRET,
+        redirect_uri:  GFIT_REDIRECT_URI,
+        grant_type:    'authorization_code'
+      }).toString()
+    });
+
+    const tokenData = await tokenResp.json();
+
+    if (!tokenResp.ok) {
+      console.error('❌ Token exchange failed:', tokenData);
+      throw new Error(tokenData.error_description || tokenData.error || 'Token exchange failed');
+    }
+
+    const { access_token, expires_in, refresh_token } = tokenData;
+    console.log('✅ Token Google Fit obtenu — expires_in:', expires_in);
+
+    // Rediriger vers localhost avec le token dans le fragment (#)
+    // → Détecté par l'InAppBrowser Cordova via l'événement loadstart
+    const redirectUrl = 'https://localhost/#' + new URLSearchParams({
+      gfit_token:      access_token,
+      gfit_expires_in: String(expires_in || 3600),
+      gfit_refresh:    refresh_token || ''
+    }).toString();
+
+    res.redirect(redirectUrl);
+
+  } catch (err) {
+    console.error('❌ /api/gfit/callback error:', err.message);
+    res.redirect('https://localhost/#gfit_error=' + encodeURIComponent(err.message));
+  }
+});
+
+/**
+ * ÉTAPE 3 — Proxy Google Fit API
+ * L'app envoie son token, le serveur appelle Google Fit et retourne les données
+ * POST /api/gfit/data  { startMs, endMs }
+ * Header : Authorization: Bearer <access_token>
+ */
+app.post('/api/gfit/data', async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Token manquant — connecte-toi à Google Fit d\'abord' });
+  }
+
+  const token = authHeader.split(' ')[1];
+  const { startMs, endMs } = req.body;
+
+  if (!startMs || !endMs) {
+    return res.status(400).json({ error: 'startMs et endMs requis' });
+  }
+
+  const fitHeaders = {
+    'Authorization': `Bearer ${token}`,
+    'Content-Type': 'application/json'
+  };
+
+  const aggregateBody = (dataTypeName) => JSON.stringify({
+    aggregateBy: [{ dataTypeName }],
+    bucketByTime: { durationMillis: 86400000 },
+    startTimeMillis: startMs,
+    endTimeMillis: endMs
+  });
+
+  try {
+    const [stepsResp, calResp] = await Promise.all([
+      fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate', {
+        method: 'POST', headers: fitHeaders,
+        body: aggregateBody('com.google.step_count.delta')
+      }),
+      fetch('https://www.googleapis.com/fitness/v1/users/me/dataset:aggregate', {
+        method: 'POST', headers: fitHeaders,
+        body: aggregateBody('com.google.calories.expended')
+      })
+    ]);
+
+    // Récupérer les sessions sommeil
+    const sleepResp = await fetch(
+      `https://www.googleapis.com/fitness/v1/users/me/sessions?startTime=${new Date(startMs - 86400000).toISOString()}&endTime=${new Date(endMs).toISOString()}&activityType=72`,
+      { headers: fitHeaders }
+    );
+
+    if (stepsResp.status === 401 || calResp.status === 401) {
+      return res.status(401).json({ error: 'Token expiré — reconnecte-toi à Google Fit' });
+    }
+
+    const [stepsData, calData, sleepData] = await Promise.all([
+      stepsResp.json(), calResp.json(), sleepResp.json()
+    ]);
+
+    // ── Extraire les pas ──
+    let steps = 0;
+    ((stepsData.bucket || [])[0]?.dataset || []).forEach(ds => {
+      (ds.point || []).forEach(pt => {
+        steps += (pt.value || []).reduce((a, v) => a + (v.intVal || 0), 0);
+      });
+    });
+
+    // ── Extraire les calories brûlées ──
+    let calBurned = 0;
+    ((calData.bucket || [])[0]?.dataset || []).forEach(ds => {
+      (ds.point || []).forEach(pt => {
+        calBurned += (pt.value || []).reduce((a, v) => a + (v.fpVal || 0), 0);
+      });
+    });
+
+    // ── Extraire le sommeil ──
+    let sleepHours = 0;
+    (sleepData.session || []).forEach(sess => {
+      sleepHours += (parseInt(sess.endTimeMillis) - parseInt(sess.startTimeMillis)) / 3600000;
+    });
+
+    // ── Distance estimée depuis pas ──
+    const distKm = parseFloat((steps * 0.00075).toFixed(2));
+
+    console.log(`📊 /api/gfit/data — steps:${steps} cal:${Math.round(calBurned)} sleep:${sleepHours.toFixed(1)}h dist:${distKm}km`);
+
+    res.json({
+      steps,
+      calBurned: Math.round(calBurned),
+      sleepHours: parseFloat(sleepHours.toFixed(1)),
+      distKm
+    });
+
+  } catch (err) {
+    console.error('❌ /api/gfit/data error:', err);
+    res.status(500).json({ error: err.message || 'Erreur Google Fit' });
+  }
+});
+
+/**
+ * ÉTAPE 4 (optionnel) — Rafraîchir le token avec le refresh_token
+ * POST /api/gfit/refresh  { refresh_token }
+ */
+app.post('/api/gfit/refresh', async (req, res) => {
+  const { refresh_token } = req.body;
+  if (!refresh_token) return res.status(400).json({ error: 'refresh_token requis' });
+  if (!GFIT_CLIENT_SECRET) return res.status(500).json({ error: 'GOOGLE_CLIENT_SECRET manquant' });
+
+  try {
+    const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        refresh_token,
+        client_id:     GFIT_CLIENT_ID,
+        client_secret: GFIT_CLIENT_SECRET,
+        grant_type:    'refresh_token'
+      }).toString()
+    });
+
+    const data = await tokenResp.json();
+    if (!tokenResp.ok) throw new Error(data.error_description || 'Refresh failed');
+
+    res.json({
+      access_token: data.access_token,
+      expires_in:   data.expires_in || 3600
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Erreurs globales ─────────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
@@ -162,4 +389,5 @@ app.listen(PORT, HOST, () => {
   console.log(`📡 Chat model  : ${GROQ_CHAT_MODEL}`);
   console.log(`📷 Vision model: ${GROQ_VISION_MODEL}`);
   console.log(`🔑 GROQ_API_KEY: ${GROQ_API_KEY ? '✅ configurée' : '❌ MANQUANTE'}`);
+  console.log(`🏃 Google Fit  : ${GFIT_CLIENT_SECRET ? '✅ secret configuré' : '⚠️ GOOGLE_CLIENT_SECRET manquant'}`);
 });
